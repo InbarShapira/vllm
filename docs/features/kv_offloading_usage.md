@@ -69,7 +69,7 @@ vllm serve <model> \
 | `spec_name` | no | `CPUOffloadingSpec` | both | Set to `TieringOffloadingSpec` for multi-tier. |
 | `cpu_bytes_to_use` | yes | — | both | Total bytes of host memory reserved for the CPU tier across all workers (not per-worker). |
 | `block_size` | no | GPU block size | both | Offloaded block size in tokens; must be a multiple of the GPU block size. |
-| `eviction_policy` | no | `lru` | both | Primary tier policy: `lru` or `arc`. |
+| `eviction_policy` | no | `lru` | both | Primary tier policy: `lru`, `arc`, or `sae` (see [Eviction Policy](#eviction-policy)). |
 | `store_threshold` | no | `0` | single-tier | Min lookups before a block is offloaded. Values ≥ 2 are rejected by `TieringOffloadingSpec`. |
 | `max_tracker_size` | no | `64000` | single-tier | Max entries in the lookup tracker. |
 | `secondary_tiers` | no | `[]` | multi-tier | List of secondary tier configs (see below). |
@@ -133,6 +133,46 @@ The P2P tier (`type: "p2p"`) shares completed KV blocks between vLLM instances o
 | `num_threads` | no | `4` | NIXL agent worker threads. Only used when `backends` is UCX-only; ignored when any non-UCX backend is requested. |
 
 The `backends` and `num_threads` options mirror the conditional logic used by [`NixlConnector`](nixl_connector_usage.md#selecting-a-nixl-transport-backend-plugin): when any non-UCX backend is configured, NIXL is initialised with `backends=...`; otherwise it falls back to a UCX-only agent with the configured `num_threads`. This lets the P2P tier use a different transport (e.g. `MOONCAKE`, `GDS_MT`, `LIBFABRIC`) than the main `NixlConnector` running in the same process.
+
+## Eviction Policy
+
+`kv_connector_extra_config["eviction_policy"]` selects the CPU primary tier eviction policy. Supported values: `"lru"` (default), `"arc"`, `"sae"`.
+
+**SAE (Session-Aware Eviction)** groups newly-stored blocks into sessions (reconstructed from the sequence of `insert`/`touch`/`evict`/`remove`/`clear` calls) and tracks per-session hit history plus per-key "ghost" scores that persist across evictions. On `evict`, SAE walks sessions worst-first and applies an admission gate that declines eviction when the incoming session's ghost-derived score is below the worst incumbent's — biasing eviction toward sessions with weaker recent access patterns.
+
+All SAE tunables live under `kv_connector_extra_config`:
+
+| Key | Default | Validation |
+| --- | --- | --- |
+| `sae_decay_interval` | `500` | `>= 1` — lookups between decay ticks. |
+| `sae_decay_factor` | `0.9` | `0.0 < x <= 1.0` — scale factor per decay tick. |
+| `sae_ghost_hit_weight` | `12.0` | `>= 0.0` — ghost score bump on resident-ready hits. |
+| `sae_ghost_miss_weight` | `1.0` | `>= 0.0` — ghost score bump on misses / non-ready blocks. |
+| `sae_ghost_norm` | `12.0` | `> 0.0` — divisor when seeding a new session's initial hits from its keys' ghost scores. |
+
+Invalid values (or any `sae_*` key set when `eviction_policy` is not `"sae"`) raise `ValueError` at server startup.
+
+Example:
+
+```json
+{
+  "kv_connector": "OffloadingConnector",
+  "kv_role": "kv_both",
+  "kv_connector_extra_config": {
+    "cpu_bytes_to_use": 17179869184,
+    "eviction_policy": "sae",
+    "sae_decay_interval": 500,
+    "sae_decay_factor": 0.9
+  }
+}
+```
+
+**Per-policy metrics.** All three policies emit four cache-effectiveness counters on `/metrics`, each labelled by `policy` (`lru`/`arc`/`sae`):
+
+- `vllm:cpu_block_lookup_total` — total lookup calls (hits + misses; `HIT_PENDING` counts as a hit; `RETRY` is not counted).
+- `vllm:cpu_block_hit_total` — lookup hits.
+- `vllm:cpu_block_miss_total` — lookup misses.
+- `vllm:block_eviction_total` — blocks evicted.
 
 ## Tuning Tips
 
