@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections import OrderedDict
 from collections.abc import Collection, Iterable
-from typing import Literal
+from typing import Any, Literal
 
 from typing_extensions import override
 
@@ -26,16 +26,18 @@ from vllm.v1.kv_offload.cpu.common import (
 from vllm.v1.kv_offload.cpu.policies.arc import ARCCachePolicy
 from vllm.v1.kv_offload.cpu.policies.base import BlockStatus, CachePolicy
 from vllm.v1.kv_offload.cpu.policies.lru import LRUCachePolicy
+from vllm.v1.kv_offload.cpu.policies.sae import SAECachePolicy
 
 _CACHE_POLICIES: dict[str, type[CachePolicy]] = {
     "lru": LRUCachePolicy,
     "arc": ARCCachePolicy,
+    "sae": SAECachePolicy,
 }
 
 
 class CPUOffloadingManager(OffloadingManager):
     """
-    An OffloadingManager with a pluggable CachePolicy (LRU or ARC).
+    An OffloadingManager with a pluggable CachePolicy (LRU, ARC, or SAE).
 
     The manager owns all shared logic: ref-counting, event emission,
     block pool management, and the prepare_store/complete_store skeletons.
@@ -46,10 +48,11 @@ class CPUOffloadingManager(OffloadingManager):
     def __init__(
         self,
         num_blocks: int,
-        cache_policy: Literal["lru", "arc"] = "lru",
+        cache_policy: Literal["lru", "arc", "sae"] = "lru",
         enable_events: bool = False,
         store_threshold: int = 1,
         max_tracker_size: int = 64_000,
+        policy_kwargs: dict[str, Any] | None = None,
     ):
         self.medium: str = CPULoadStoreSpec.medium()
         self._num_blocks: int = num_blocks
@@ -62,7 +65,9 @@ class CPUOffloadingManager(OffloadingManager):
                 f"Unknown cache policy: {cache_policy!r}. "
                 f"Supported: {list(_CACHE_POLICIES)}"
             )
-        self._policy: CachePolicy = policy_cls(cache_capacity=num_blocks)
+        kwargs = policy_kwargs or {}
+        self._policy: CachePolicy = policy_cls(cache_capacity=num_blocks, **kwargs)
+        self._policy_name: str = cache_policy
         # Track the number of blocks in the cache that are evictable. i.e. ref_cnt 0.
         self._num_evictable_cache_blocks: int = 0
 
