@@ -5,6 +5,7 @@ from typing import Any
 from typing_extensions import override
 
 from vllm.config import VllmConfig
+from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.utils.math_utils import round_up
 from vllm.v1.kv_cache_interface import KVCacheConfig
@@ -20,6 +21,55 @@ from vllm.v1.kv_offload.base import (
 from vllm.v1.kv_offload.cpu.common import CPUOffloadingMetrics
 from vllm.v1.kv_offload.cpu.gpu_worker import CPUOffloadingWorker
 from vllm.v1.kv_offload.cpu.manager import CPUOffloadingManager
+
+logger = init_logger(__name__)
+
+_SUPPORTED_POLICIES = ("lru", "arc", "sae")
+
+_SAE_TUNABLE_DEFAULTS: dict[str, tuple[type, object]] = {
+    "sae_decay_interval": (int, 500),
+    "sae_decay_factor": (float, 0.9),
+    "sae_ghost_hit_weight": (float, 12.0),
+    "sae_ghost_miss_weight": (float, 1.0),
+    "sae_ghost_norm": (float, 12.0),
+}
+
+
+def _validate_sae_tunables(extra_config: dict[str, Any]) -> dict[str, Any]:
+    """Extract and validate SAE tunables from extra_config.
+
+    Returns:
+        A dict of ``SAECachePolicy`` constructor kwargs
+        (``decay_interval``, ``decay_factor``, ``ghost_hit_weight``,
+        ``ghost_miss_weight``, ``ghost_norm``).
+
+    Raises:
+        ValueError: on out-of-range values, naming the offending key.
+    """
+    kwargs: dict[str, Any] = {}
+    for key, (expected_type, default) in _SAE_TUNABLE_DEFAULTS.items():
+        raw = extra_config.get(key, default)
+        try:
+            value = expected_type(raw)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"{key}={raw!r} is not a valid {expected_type.__name__}"
+            ) from exc
+
+        if key == "sae_decay_interval" and value < 1:
+            raise ValueError(f"{key}={value} must be >= 1")
+        if key == "sae_decay_factor" and not (0.0 < value <= 1.0):
+            raise ValueError(f"{key}={value} must satisfy 0.0 < x <= 1.0")
+        if key == "sae_ghost_hit_weight" and value < 0.0:
+            raise ValueError(f"{key}={value} must be >= 0.0")
+        if key == "sae_ghost_miss_weight" and value < 0.0:
+            raise ValueError(f"{key}={value} must be >= 0.0")
+        if key == "sae_ghost_norm" and value <= 0.0:
+            raise ValueError(f"{key}={value} must be > 0.0")
+
+        # Strip "sae_" prefix for the CachePolicy constructor kwarg name.
+        kwargs[key[len("sae_") :]] = value
+    return kwargs
 
 
 class CPUOffloadingSpec(OffloadingSpec):
@@ -37,7 +87,36 @@ class CPUOffloadingSpec(OffloadingSpec):
                     "values indicate transfers (stores or promotions) may be "
                     "dropped due to insufficient capacity."
                 ),
-            )
+            ),
+            CPUOffloadingMetrics.CPU_BLOCK_LOOKUP: OffloadingCounterMetadata(
+                documentation=(
+                    "Total CPU KV cache lookup calls, labelled by eviction "
+                    "policy (lru/arc/sae). Sum of hits and misses "
+                    "(HIT_PENDING counts as a hit; RETRY is not counted)."
+                ),
+                labelnames=("policy",),
+            ),
+            CPUOffloadingMetrics.CPU_BLOCK_HIT: OffloadingCounterMetadata(
+                documentation=(
+                    "Total CPU KV cache lookup hits, labelled by eviction "
+                    "policy (lru/arc/sae). HIT_PENDING counts as a hit."
+                ),
+                labelnames=("policy",),
+            ),
+            CPUOffloadingMetrics.CPU_BLOCK_MISS: OffloadingCounterMetadata(
+                documentation=(
+                    "Total CPU KV cache lookup misses, labelled by eviction "
+                    "policy (lru/arc/sae)."
+                ),
+                labelnames=("policy",),
+            ),
+            CPUOffloadingMetrics.BLOCK_EVICTION: OffloadingCounterMetadata(
+                documentation=(
+                    "Total CPU KV cache blocks evicted, labelled by eviction "
+                    "policy (lru/arc/sae)."
+                ),
+                labelnames=("policy",),
+            ),
         }
         store_threshold = int(extra_config.get("store_threshold", 0))
         if store_threshold >= 2:
@@ -104,6 +183,26 @@ class CPUOffloadingSpec(OffloadingSpec):
         self._worker: CPUOffloadingWorker | None = None
 
         self.eviction_policy: str = self.extra_config.get("eviction_policy", "lru")
+        if self.eviction_policy not in _SUPPORTED_POLICIES:
+            raise ValueError(
+                f"eviction_policy={self.eviction_policy!r} is not supported. "
+                f"Supported: {list(_SUPPORTED_POLICIES)}"
+            )
+
+        offending_sae_keys = [k for k in self.extra_config if k.startswith("sae_")]
+        if self.eviction_policy != "sae" and offending_sae_keys:
+            raise ValueError(
+                f"SAE-specific keys {offending_sae_keys!r} are set but "
+                f"eviction_policy={self.eviction_policy!r} is not 'sae'."
+            )
+
+        self._sae_policy_kwargs: dict[str, Any] = (
+            _validate_sae_tunables(self.extra_config)
+            if self.eviction_policy == "sae"
+            else {}
+        )
+
+        logger.info("CPU offload: eviction_policy=%s", self.eviction_policy)
 
     @override
     def get_manager(self) -> OffloadingManager:
@@ -122,6 +221,7 @@ class CPUOffloadingSpec(OffloadingSpec):
                 enable_events=self.kv_events_config.enable_kv_cache_events,
                 store_threshold=store_threshold,
                 max_tracker_size=max_tracker_size,
+                policy_kwargs=self._sae_policy_kwargs,
             )
         return self._manager
 
