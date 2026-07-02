@@ -22,6 +22,7 @@
 ## File Structure
 
 **New files:**
+
 - `vllm/v1/kv_offload/cpu/policies/sae.py` — `SAECachePolicy` class (~280 lines).
 - `tests/v1/kv_offload/cpu/policies/__init__.py` — empty test package init.
 - `tests/v1/kv_offload/cpu/policies/test_sae_policy.py` — SAE algorithm unit tests.
@@ -29,11 +30,13 @@
 - `tests/v1/kv_offload/cpu/test_spec_config_validation.py` — `CPUOffloadingSpec` config validation tests.
 
 **Modified files:**
+
 - `vllm/v1/kv_offload/cpu/manager.py` — register `"sae"` in `_CACHE_POLICIES`; widen `cache_policy` Literal; add `policy_kwargs` kwarg; add 4 counter deltas and emit them in `get_stats()`.
 - `vllm/v1/kv_offload/cpu/spec.py` — validate `eviction_policy`; extract/validate `sae_*` tunables; add 4 counter definitions; pass `policy_kwargs`; log startup INFO line.
 - `docs/features/disagg_prefill.md` or the closest existing CPU-offload doc — small addition noting `"sae"` is an accepted value.
 
 **Untouched:**
+
 - `vllm/v1/kv_offload/cpu/policies/base.py`, `.../lru.py`, `.../arc.py`.
 - `vllm/distributed/kv_transfer/kv_connector/v1/offloading/metrics.py` — `OffloadingConnectorStats` and `OffloadPromMetrics` handle labelled counters already.
 
@@ -91,10 +94,10 @@ class CPUOffloadingManager(OffloadingManager):
 ```python
 # Counter names emitted by CPUOffloadingManager.get_stats()
 
-CPU_BLOCK_LOOKUP = "vllm:cpu_block_lookup_total"
-CPU_BLOCK_HIT = "vllm:cpu_block_hit_total"
-CPU_BLOCK_MISS = "vllm:cpu_block_miss_total"
-CPU_BLOCK_EVICTION = "vllm:block_eviction_total"
+CPU_BLOCK_LOOKUP = "vllm:kv_offload_cpu_block_lookup_total"
+CPU_BLOCK_HIT = "vllm:kv_offload_cpu_block_hit_total"
+CPU_BLOCK_MISS = "vllm:kv_offload_cpu_block_miss_total"
+CPU_BLOCK_EVICTION = "vllm:kv_offload_block_eviction_total"
 # All four carry a "policy" label.
 ```
 
@@ -103,11 +106,13 @@ CPU_BLOCK_EVICTION = "vllm:block_eviction_total"
 ## Task 1: SAE policy skeleton — construction, empty state, `get` for a missing key
 
 **Files:**
+
 - Create: `vllm/v1/kv_offload/cpu/policies/sae.py`
 - Create: `tests/v1/kv_offload/cpu/policies/__init__.py` (empty)
 - Test: `tests/v1/kv_offload/cpu/policies/test_sae_policy.py`
 
 **Interfaces:**
+
 - Consumes: `CachePolicy`, `BlockStatus`, `OffloadKey` from existing base module.
 - Produces: `SAECachePolicy(cache_capacity, *, decay_interval, decay_factor, ghost_hit_weight, ghost_miss_weight, ghost_norm)` with `.get(key) -> BlockStatus | None`.
 
@@ -270,10 +275,12 @@ EOF
 ## Task 2: `insert` and `remove` — session boundary detection
 
 **Files:**
+
 - Modify: `vllm/v1/kv_offload/cpu/policies/sae.py`
 - Test: `tests/v1/kv_offload/cpu/policies/test_sae_policy.py`
 
 **Interfaces:**
+
 - Consumes: `SAECachePolicy` skeleton from Task 1.
 - Produces: `insert` and `remove` behavior; `_open_sid`, `_last_event`, `_sid_to_keys`, `_key_to_sid`, `_sid_stats` maintained correctly.
 
@@ -414,10 +421,12 @@ EOF
 ## Task 3: `touch` and `clear` — session close and hit accounting
 
 **Files:**
+
 - Modify: `vllm/v1/kv_offload/cpu/policies/sae.py`
 - Test: `tests/v1/kv_offload/cpu/policies/test_sae_policy.py`
 
 **Interfaces:**
+
 - Consumes: session state from Task 2.
 - Produces: `touch(keys)` bumps `hits` and `last_touch`; `clear()` resets all state; both close the open session.
 
@@ -534,10 +543,12 @@ EOF
 ## Task 4: `get` overrides — ghost score accumulation and periodic decay
 
 **Files:**
+
 - Modify: `vllm/v1/kv_offload/cpu/policies/sae.py`
 - Test: `tests/v1/kv_offload/cpu/policies/test_sae_policy.py`
 
 **Interfaces:**
+
 - Consumes: state from Tasks 1–3.
 - Produces: `get(key)` accumulates ghost scores; decay runs every `decay_interval`-th call, scaling `hits` and `_key_ghost` by `decay_factor` and pruning non-resident ghost entries below `0.01`.
 
@@ -665,10 +676,12 @@ EOF
 ## Task 5: `mark_evictable` / `mark_non_evictable` — evictable-key tracking
 
 **Files:**
+
 - Modify: `vllm/v1/kv_offload/cpu/policies/sae.py`
 - Test: `tests/v1/kv_offload/cpu/policies/test_sae_policy.py`
 
 **Interfaces:**
+
 - Consumes: skeleton from Task 1 (`_evictable_keys` field).
 - Produces: `mark_evictable(key)` adds to `_evictable_keys`; `mark_non_evictable(key)` removes.
 
@@ -744,10 +757,12 @@ EOF
 ## Task 6: `evict` — worst-first session walk with admission gate
 
 **Files:**
+
 - Modify: `vllm/v1/kv_offload/cpu/policies/sae.py`
 - Test: `tests/v1/kv_offload/cpu/policies/test_sae_policy.py`
 
 **Interfaces:**
+
 - Consumes: session state, ghost scores, `_evictable_keys` from Tasks 2–5.
 - Produces: `evict(n, protected)` returns a list of `n` (key, block) tuples selected worst-session-first from idle, non-protected blocks; returns `None` when the admission gate denies or when `n` cannot be satisfied.
 
@@ -958,10 +973,12 @@ EOF
 ## Task 7: Register SAE in `_CACHE_POLICIES` and add `policy_kwargs`
 
 **Files:**
+
 - Modify: `vllm/v1/kv_offload/cpu/manager.py`
 - Test: `tests/v1/kv_offload/cpu/policies/test_sae_policy.py`
 
 **Interfaces:**
+
 - Consumes: `SAECachePolicy` from Tasks 1–6.
 - Produces: `CPUOffloadingManager(cache_policy="sae", policy_kwargs={"decay_interval": ...}, ...)` constructs a manager whose `_policy` is `SAECachePolicy` with the specified tunables.
 
@@ -1095,23 +1112,25 @@ EOF
 ## Task 8: Four per-policy counters — manager-side tallies and stats emission
 
 **Files:**
+
 - Modify: `vllm/v1/kv_offload/cpu/manager.py`
 - Modify: `vllm/v1/kv_offload/cpu/common.py`
 - Create: `tests/v1/kv_offload/cpu/test_manager_policy_metrics.py`
 
 **Interfaces:**
+
 - Consumes: `CPUOffloadingManager` from Task 7.
-- Produces: `get_stats()` emits `vllm:cpu_block_lookup_total`, `vllm:cpu_block_hit_total`, `vllm:cpu_block_miss_total`, `vllm:block_eviction_total` — each with `labelvalues=(policy_name,)`. Deltas reset each call.
+- Produces: `get_stats()` emits `vllm:kv_offload_cpu_block_lookup_total`, `vllm:kv_offload_cpu_block_hit_total`, `vllm:kv_offload_cpu_block_miss_total`, `vllm:kv_offload_block_eviction_total` — each with `labelvalues=(policy_name,)`. Deltas reset each call.
 
 - [ ] **Step 1: Locate `CPUOffloadingMetrics` and add four new constants**
 
 Read `vllm/v1/kv_offload/cpu/common.py` to find the `CPUOffloadingMetrics` class. Add four new class attributes (adjacent to the existing `CPU_CACHE_USAGE_PERC` and `STORES_SKIPPED`):
 
 ```python
-    CPU_BLOCK_LOOKUP = "vllm:cpu_block_lookup_total"
-    CPU_BLOCK_HIT = "vllm:cpu_block_hit_total"
-    CPU_BLOCK_MISS = "vllm:cpu_block_miss_total"
-    BLOCK_EVICTION = "vllm:block_eviction_total"
+    CPU_BLOCK_LOOKUP = "vllm:kv_offload_cpu_block_lookup_total"
+    CPU_BLOCK_HIT = "vllm:kv_offload_cpu_block_hit_total"
+    CPU_BLOCK_MISS = "vllm:kv_offload_cpu_block_miss_total"
+    BLOCK_EVICTION = "vllm:kv_offload_block_eviction_total"
 ```
 
 - [ ] **Step 2: Write failing counter-emission tests**
@@ -1318,8 +1337,8 @@ feat(kv_offload): per-policy cache effectiveness counters
 
 CPUOffloadingManager now tallies lookups/hits/misses/evictions per
 call cycle and emits them via get_stats() as four labelled Prometheus
-counters (vllm:cpu_block_lookup_total, cpu_block_hit_total,
-cpu_block_miss_total, block_eviction_total), each carrying a
+counters (vllm:kv_offload_cpu_block_lookup_total, kv_offload_cpu_block_hit_total,
+kv_offload_cpu_block_miss_total, kv_offload_block_eviction_total), each carrying a
 "policy" label so all three policies (lru/arc/sae) surface uniformly
 on a single dashboard. HIT_PENDING counts as a hit; RETRY does not
 increment lookups.
@@ -1334,10 +1353,12 @@ EOF
 ## Task 9: `CPUOffloadingSpec` — validation, tunable extraction, counter metadata, startup log
 
 **Files:**
+
 - Modify: `vllm/v1/kv_offload/cpu/spec.py`
 - Create: `tests/v1/kv_offload/cpu/test_spec_config_validation.py`
 
 **Interfaces:**
+
 - Consumes: `CPUOffloadingManager(cache_policy, policy_kwargs)` from Tasks 7–8.
 - Produces: `CPUOffloadingSpec.__init__` validates `eviction_policy` in `{"lru","arc","sae"}`, extracts `sae_*` tunables when policy is `sae`, rejects `sae_*` keys under non-SAE policies, adds four counter definitions to `build_metric_definitions`, logs `"CPU offload: eviction_policy=<name>"` at INFO.
 
@@ -1656,6 +1677,7 @@ EOF
 ## Task 10: Docs — mention SAE in the CPU offload doc page
 
 **Files:**
+
 - Modify: an existing CPU-offload docs file (see Step 1 to locate).
 
 - [ ] **Step 1: Find the current CPU offload doc**
@@ -1689,8 +1711,8 @@ patterns. Tunables (all under `kv_connector_extra_config`):
 
 All three policies emit four cache-effectiveness counters on
 `/metrics`, labelled by `policy`:
-`vllm:cpu_block_lookup_total`, `vllm:cpu_block_hit_total`,
-`vllm:cpu_block_miss_total`, `vllm:block_eviction_total`.
+`vllm:kv_offload_cpu_block_lookup_total`, `vllm:kv_offload_cpu_block_hit_total`,
+`vllm:kv_offload_cpu_block_miss_total`, `vllm:kv_offload_block_eviction_total`.
 ```
 
 - [ ] **Step 3: Run pre-commit and commit**
@@ -1716,6 +1738,7 @@ EOF
 ## Task 11: End-to-end smoke — spec constructs, manager runs, counters flow through
 
 **Files:**
+
 - Create: `tests/v1/kv_offload/cpu/test_sae_end_to_end.py`
 
 - [ ] **Step 1: Write an end-to-end test**
@@ -1806,18 +1829,18 @@ EOF
 ## Self-Review Notes
 
 - **Spec coverage:**
-  - SAE as a `CachePolicy` sibling of LRU/ARC → Tasks 1–7.
-  - Session boundary reconstruction (`insert` after `touch`/`evict`/`remove`/`clear`) → Task 2.
-  - Ghost score accumulation and decay → Task 4.
-  - Admission gate inside `evict` → Task 6.
-  - Worst-first eviction walk → Task 6.
-  - No changes to `CachePolicy` ABC → verified: only `sae.py` and `manager.py` (registration) are touched among policy files. `base.py`, `lru.py`, `arc.py` untouched.
-  - Four per-policy counters with `policy` label → Task 8, exposed via spec metadata in Task 9.
-  - Fail-fast validation of `eviction_policy` and SAE tunables → Task 9.
-  - `sae_*` keys under non-SAE policy → single `ValueError` → Task 9.
-  - INFO log line at startup → Task 9.
-  - `extra_config`-only config surface (no env vars, no TOML) → Task 9.
-  - No LRU/ARC behavior change → confirmed by re-running `test_manager.py` in Tasks 7 and 9.
+    - SAE as a `CachePolicy` sibling of LRU/ARC → Tasks 1–7.
+    - Session boundary reconstruction (`insert` after `touch`/`evict`/`remove`/`clear`) → Task 2.
+    - Ghost score accumulation and decay → Task 4.
+    - Admission gate inside `evict` → Task 6.
+    - Worst-first eviction walk → Task 6.
+    - No changes to `CachePolicy` ABC → verified: only `sae.py` and `manager.py` (registration) are touched among policy files. `base.py`, `lru.py`, `arc.py` untouched.
+    - Four per-policy counters with `policy` label → Task 8, exposed via spec metadata in Task 9.
+    - Fail-fast validation of `eviction_policy` and SAE tunables → Task 9.
+    - `sae_*` keys under non-SAE policy → single `ValueError` → Task 9.
+    - INFO log line at startup → Task 9.
+    - `extra_config`-only config surface (no env vars, no TOML) → Task 9.
+    - No LRU/ARC behavior change → confirmed by re-running `test_manager.py` in Tasks 7 and 9.
 - **Placeholder scan:** no TBDs, no "similar to Task N", no "add error handling" — all code is explicit.
 - **Type/name consistency:** `_policy_name` (str), `_sae_policy_kwargs` (dict), `SAECachePolicy` constructor kwargs (`decay_interval`, `decay_factor`, `ghost_hit_weight`, `ghost_miss_weight`, `ghost_norm`) — consistent across Tasks 7, 8, 9. Counter names on `CPUOffloadingMetrics` are used consistently in Tasks 8, 9, 11.
 

@@ -169,10 +169,10 @@ Example:
 
 **Per-policy metrics.** All three policies emit four cache-effectiveness counters on `/metrics`, each labelled by `policy` (`lru`/`arc`/`sae`):
 
-- `vllm:cpu_block_lookup_total` — total lookup calls (hits + misses; `HIT_PENDING` counts as a hit; `RETRY` is not counted).
-- `vllm:cpu_block_hit_total` — lookup hits.
-- `vllm:cpu_block_miss_total` — lookup misses.
-- `vllm:block_eviction_total` — blocks evicted.
+- `vllm:kv_offload_cpu_block_lookup_total` — total lookup calls (hits + misses; `HIT_PENDING` counts as a hit; `RETRY` is not counted).
+- `vllm:kv_offload_cpu_block_hit_total` — lookup hits.
+- `vllm:kv_offload_cpu_block_miss_total` — lookup misses.
+- `vllm:kv_offload_block_eviction_total` — blocks evicted.
 
 ## Tuning Tips
 

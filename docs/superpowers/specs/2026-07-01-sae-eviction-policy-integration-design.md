@@ -57,8 +57,8 @@ The reference `SessionAwareEvictionManager` (in the plugin package)
 was written against vLLM 0.18's `OffloadingManager` interface, which
 handed the manager whole batches of block hashes on `lookup`,
 `prepare_store`, etc. Current vLLM's `CachePolicy` is a strictly
-per-key surface with `touch(keys)` as the only batch method. Two
-semantic differences follow — both preserve the algorithm's intent
+per-key surface with `touch(keys)` as the only batch method. Three
+semantic differences follow — all preserve the algorithm's intent
 while fitting the current interface:
 
 **1. Session boundaries are reconstructed from the call sequence.**
@@ -86,6 +86,20 @@ Relative ordering of session scores is preserved; absolute
 magnitudes shift, and the tunables' defaults are chosen to match
 the reference's effective behavior on a representative workload
 after this simplification.
+
+**3. `start_pos` is always zero.** The reference computed
+`start_pos = bh_list.index(to_store[0])` — the offset of the first
+not-yet-stored key inside the full `prepare_store` batch — and
+used it in `pos_bonus = 30000.0 / (1.0 + start_pos / 8.0)` on both
+`_get_score` and the admission gate baseline. The port's per-key
+`insert` interface has no batch to index into, so every session
+opens with `start_pos = 0` and its `pos_bonus` is a fixed
+`30000.0`. Because `_score` and the admission-gate baseline both
+use the same `pos_bonus`, they remain internally consistent — the
+gate compares apples to apples. Absolute score magnitudes are
+slightly higher than they would be under the reference for
+sessions that in v0.18 would have had `start_pos > 0`, but the
+relative worst-first ordering is unchanged.
 
 ## Architecture
 
@@ -121,9 +135,17 @@ keys inserted into the currently-open session up to that point.
 The seeding runs once per session — on the first `insert` that
 opens the session — using only the ghost score of that first key.
 Subsequent inserts into the same session add their ghost score to
-the session's `hits` field. This yields the same total as the
-reference algorithm's "seed from ghost sum of `to_store`" step:
-the sum is just built up incrementally rather than in one shot.
+the session's `hits` field.
+
+**Float accumulation, int at close.** The reference computes
+`initial_hits = int(ghost_sum / ghost_norm)` in one shot at
+session open. The port accumulates as float across `insert` calls
+(so consecutive inserts add fractional contributions correctly)
+and truncates to int via `_seal_open_session()` at every session
+close (`touch` / `evict` / `remove` / `clear`). This yields the
+same integer `hits` value the reference would have produced from
+the same ghost sum, and keeps subsequent `hits += 1` bumps in
+`touch` integer-aligned with the reference.
 
 The admission gate still needs somewhere to run. Since the gate
 compares a new session's hypothetical score to the worst
@@ -138,12 +160,12 @@ Add four counter definitions to
 `CPUOffloadingSpec.build_metric_definitions()` unconditionally (they
 exist for every CPU-offload policy):
 
-| Metric name                       | Type    | Labels                    |
-|-----------------------------------|---------|---------------------------|
-| `vllm:cpu_block_lookup_total`     | counter | (existing) + `policy`     |
-| `vllm:cpu_block_hit_total`        | counter | (existing) + `policy`     |
-| `vllm:cpu_block_miss_total`       | counter | (existing) + `policy`     |
-| `vllm:block_eviction_total`       | counter | (existing) + `policy`     |
+| Metric name                              | Type    | Labels                |
+|------------------------------------------|---------|-----------------------|
+| `vllm:kv_offload_cpu_block_lookup_total` | counter | (existing) + `policy` |
+| `vllm:kv_offload_cpu_block_hit_total`    | counter | (existing) + `policy` |
+| `vllm:kv_offload_cpu_block_miss_total`   | counter | (existing) + `policy` |
+| `vllm:kv_offload_block_eviction_total`   | counter | (existing) + `policy` |
 
 `CPUOffloadingManager` maintains four in-memory delta counters
 (`_lookups_delta`, `_hits_delta`, `_misses_delta`,
@@ -203,8 +225,10 @@ new methods):
   increments `_lookup_count`; updates `_key_ghost[key]` by
   `ghost_hit_weight` when the key is resident and ready, by
   `ghost_miss_weight` otherwise; on every `decay_interval`-th call,
-  scales all session `hits` and all `_key_ghost` values by
-  `decay_factor` and prunes ghost entries below the threshold. Sets
+  scales all session `hits` by `decay_factor` **truncated to int**
+  (matching the reference's `int(hits * decay_factor)`), scales
+  `_key_ghost` values (float) by `decay_factor`, and prunes ghost
+  entries below the threshold for non-resident keys. Sets
   `_last_event = "get"`. Does NOT increment `_logical_timer`
   (session `last_touch` values only advance on real touches, matching
   the reference).
@@ -218,40 +242,47 @@ new methods):
   `_last_event = "insert"`.
 - `remove(key)` — cleans up `blocks`, `key_to_sid`,
   `sid_to_keys[sid]` (removing the empty list clears the sid), and
-  `_evictable_keys`. Closes the open session (`_open_sid = None`).
-  Sets `_last_event = "remove"`.
-- `touch(keys)` — increments `_logical_timer`; for each key in
-  `keys`, if `key_to_sid[key]` exists, bumps
-  `sid_stats[sid]["hits"] += 1` and sets `sid_stats[sid]
-  ["last_touch"] = _logical_timer`. Closes the open session. Sets
-  `_last_event = "touch"`.
+  `_evictable_keys`. Closes the open session via
+  `_seal_open_session()` (which truncates its accumulated float
+  `hits` to int, matching the reference's `initial_hits = int(...)`
+  step). Sets `_last_event = "remove"`.
+- `touch(keys)` — closes the open session via
+  `_seal_open_session()`; increments `_logical_timer`; collects the
+  set of **unique** session ids from `keys` and bumps each session's
+  `hits += 1` and `last_touch = _logical_timer` **once per unique
+  sid** (matching the reference's `sids_seen = set()` loop — a
+  touch batch of 10 keys from the same session adds 1, not 10).
+  Sets `_last_event = "touch"`.
 - `evict(n, protected)` — the heart of the algorithm. Closes the
-  open session. Runs the admission gate: for the *would-be* new
-  session (which the *next* `insert` will open), computes a
-  hypothetical score using the ghost sum of the pending
-  `keys_to_store`. **But `evict` doesn't know what those keys are.**
-  See the "Admission gate" subsection below for the resolution.
-  Then walks `sid_stats` sorted by score-worst-first; for each
-  session, yields idle keys (`ref_cnt == 0`, not in `protected`)
-  from the tail until `n` are collected. Returns `None` if fewer
-  than `n` are collectable. Sets `_last_event = "evict"`.
+  open session via `_seal_open_session()`. Runs the admission gate
+  (see "Admission gate" subsection below). Then walks `sid_stats`
+  sorted by score-worst-first; for each session, yields idle keys
+  (`ref_cnt == 0`, not in `protected`) from the tail until `n` are
+  collected. Returns `None` if fewer than `n` are collectable.
+  Sets `_last_event = "evict"`.
 - `clear()` — resets all state; sets `_last_event = "clear"`.
 - `mark_evictable(key)` — adds `key` to `_evictable_keys`.
 - `mark_non_evictable(key)` — removes `key` from `_evictable_keys`.
 
-**Admission gate resolution.** `evict(n, protected)` is called by
-`CPUOffloadingManager.prepare_store` at
-[manager.py:200-201](../../../vllm/v1/kv_offload/cpu/manager.py)
-with `n = num_blocks_to_evict` and
-`protected = set(keys)` — the full input batch (after
-`store_threshold` filtering but before removing already-stored keys).
-So `protected` is a superset of `keys_to_store` and matches the batch
-the reference algorithm's `prepare_store` received in v0.18. The
-admission-gate ghost sum is
-`sum(_key_ghost.get(k, 0.0) for k in protected) / ghost_norm`.
-Because `protected` includes keys that are already stored, ghost
-contributions from resident keys still count toward the new
-session's hypothetical score — same as the reference.
+**Admission gate.** The reference algorithm's admission gate at
+[manager.py:219-224](https://github.com/example/sae_kv_offload/blob/main/sae_kv_offload/manager.py)
+explicitly excludes ghost scores — the comment reads *"Block ghost
+scores are intentionally NOT included here"*. It compares a bare
+`new_val = logical_timer + pos_bonus` (where `pos_bonus = 30000.0
+/ (1.0 + start_pos / 8.0)`) against the worst incumbent's full
+`_get_score` and denies eviction when `new_val < worst_score`.
+
+The port's `_admission_gate_allows()` mirrors this: it computes
+`new_score = logical_timer + 30000.0` (no ghost-derived freq
+bonus, and a fixed `pos_bonus` because the port has no `start_pos`
+context at gate time — the session hasn't been opened yet) and
+returns `new_score >= worst_score`. `evict` returns `None` when
+the gate denies. The `protected` argument to `evict` is not used
+by the gate — it only scopes the eviction candidate walk.
+
+Because the gate excludes ghost scores by design, `protected`
+never enters the admission-gate arithmetic. This is a deliberate
+match with the reference, not an oversight of the port.
 
 ### Modified files
 
@@ -361,14 +392,14 @@ against `CPUOffloadingManager` and asserts:
 
 All keys under `kv_connector_extra_config`:
 
-| Key                     | Type  | Default | Validation             |
-|-------------------------|-------|---------|------------------------|
+| Key                     | Type  | Default | Validation               |
+|-------------------------|-------|---------|--------------------------|
 | `eviction_policy`       | str   | `"lru"` | one of `lru`/`arc`/`sae` |
-| `sae_decay_interval`    | int   | `500`   | `>= 1`                 |
-| `sae_decay_factor`      | float | `0.9`   | `0.0 < x <= 1.0`       |
-| `sae_ghost_hit_weight`  | float | `12.0`  | `>= 0.0`               |
-| `sae_ghost_miss_weight` | float | `1.0`   | `>= 0.0`               |
-| `sae_ghost_norm`        | float | `12.0`  | `> 0.0`                |
+| `sae_decay_interval`    | int   | `500`   | `>= 1`                   |
+| `sae_decay_factor`      | float | `0.9`   | `0.0 < x <= 1.0`         |
+| `sae_ghost_hit_weight`  | float | `12.0`  | `>= 0.0`                 |
+| `sae_ghost_miss_weight` | float | `1.0`   | `>= 0.0`                 |
+| `sae_ghost_norm`        | float | `12.0`  | `> 0.0`                  |
 
 Defaults match the reference algorithm's constants (recognizing the
 "Semantic differences" section above: absolute score magnitudes
